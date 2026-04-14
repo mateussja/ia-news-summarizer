@@ -2,20 +2,20 @@ name: Executar Resumo de IA
 
 on:
   schedule:
-    - cron: '0 12 * * *' # 12:00 UTC = 09:00 Horário de Brasília
-  workflow_dispatch: # Permite rodar manualmente clicando em um botão
+    - cron: '0 12 * * *' # 09:00 Horário de Brasília
+  workflow_dispatch: 
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout código
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4 # Atualizado de v3 para v4
       
       - name: Configurar Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5 # Atualizado de v4 para v5
         with:
-          python-version: '3.9'
+          python-version: '3.11' # Versão mais estável para 2026
       
       - name: Instalar bibliotecas
         run: pip install -r requirements.txt
@@ -24,4 +24,5 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # Força o uso do Node 24 como sugerido
         run: python main.py
