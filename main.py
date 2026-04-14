@@ -1,4 +1,5 @@
 import os
+import re
 import feedparser
 import requests
 import google.generativeai as genai
@@ -8,11 +9,9 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
 genai.configure(api_key=GEMINI_KEY)
-# Ajuste do nome do modelo para evitar o erro 404
-model = genai.GenerativeModel('gemini-1.5-flash')
+# FIX #3: modelo atualizado (gemini-1.5-flash foi depreciado)
+model = genai.GenerativeModel('gemini-2.0-flash')
 
-# LISTA EXPANDIDA (OFICIAIS + NOTÍCIAS)
-# Fontes Oficiais
 OFFICIAL_FEEDS = [
     'https://openai.com/news/rss.xml',
     'https://deepmind.google/blog/rss.xml',
@@ -22,7 +21,6 @@ OFFICIAL_FEEDS = [
     'https://blogs.nvidia.com/blog/category/deep-learning/feed/'
 ]
 
-# Fontes de Notícias
 NEWS_FEEDS = [
     'https://techcrunch.com/category/artificial-intelligence/feed/',
     'https://the-decoder.com/feed/',
@@ -34,27 +32,29 @@ NEWS_FEEDS = [
 ]
 
 def filter_and_summarize(all_articles):
-    # Criamos uma lista de texto com Título e Link para a IA analisar
-    articles_text = "\n".join([f"- Title: {a['title']} | Source: {a['source']} | Link: {a['link']}" for a in all_articles])
-    
+    articles_text = "\n".join([
+        f"- Title: {a['title']} | Source: {a['source']} | Link: {a['link']}"
+        for a in all_articles
+    ])
+
     prompt = f"""
     You are an expert AI news editor. Below is a list of latest AI news from official blogs and news sites.
-    
+
     TASK:
     1. Remove duplicate stories (keep only the most relevant one).
     2. RULE FOR OFFICIAL BLOGS: Only include an official announcement (from OpenAI, Meta, Google, etc.) IF there is also a news article from a tech site discussing it. If it's a standalone minor official update, ignore it.
     3. Pick the top 5-7 most important unique stories.
     4. For each selected story, write a concise summary in ENGLISH (max 2 sentences).
-    5. Format the output exactly like this:
+    5. Format the output EXACTLY like this (no extra blank lines inside a block):
     TITLE: [News Title]
     SUMMARY: [English Summary]
     LINK: [URL]
     ---
-    
+
     ARTICLES:
     {articles_text}
     """
-    
+
     try:
         response = model.generate_content(prompt)
         return response.text if response.text else None
@@ -62,49 +62,110 @@ def filter_and_summarize(all_articles):
         print(f"Error in Gemini Processing: {e}")
         return None
 
+
+def parse_blocks(result):
+    """
+    FIX #1: parser robusto usando regex, independente de linhas vazias
+    ou ordem dos campos no output do Gemini.
+    """
+    news_items = []
+    blocks = result.split("---")
+
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+
+        title_match   = re.search(r'TITLE:\s*(.+)', block, re.IGNORECASE)
+        summary_match = re.search(r'SUMMARY:\s*(.+)', block, re.IGNORECASE)
+        link_match    = re.search(r'LINK:\s*(https?://\S+)', block, re.IGNORECASE)
+
+        if title_match and summary_match and link_match:
+            title   = title_match.group(1).strip()
+            summary = summary_match.group(1).strip()
+            link    = link_match.group(1).strip()
+            news_items.append((title, summary, link))
+        else:
+            print(f"[WARN] Bloco ignorado (campos faltando):\n{block[:200]}")
+
+    return news_items
+
+
+def send_to_discord(webhook_url, news_items):
+    """
+    FIX #2: envia em multiplas mensagens se necessario,
+    sem cortar conteudo no meio.
+    """
+    if not news_items:
+        print("[WARN] Nenhuma noticia para enviar.")
+        return
+
+    header = "🤖 **INTELLIGENCE REPORT: SELECTED AI NEWS**\n\n"
+    formatted = [
+        f"🚀 **{title}**\n{summary}\n🔗 <{link}>"
+        for title, summary, link in news_items
+    ]
+
+    chunks = []
+    current = header
+    for item in formatted:
+        candidate = current + item + "\n\n"
+        if len(candidate) > 1990:
+            chunks.append(current.rstrip())
+            current = item + "\n\n"
+        else:
+            current = candidate
+
+    if current.strip():
+        chunks.append(current.rstrip())
+
+    for i, chunk in enumerate(chunks, 1):
+        resp = requests.post(webhook_url, json={"content": chunk})
+        if resp.status_code not in (200, 204):
+            print(f"[ERROR] Falha ao enviar chunk {i}: HTTP {resp.status_code} — {resp.text}")
+        else:
+            print(f"[OK] Chunk {i}/{len(chunks)} enviado.")
+
+
+def collect_feeds(feed_urls, source_label, max_per_feed=5):
+    """
+    FIX #4: coleta com tratamento de erro por feed individual.
+    """
+    articles = []
+    for url in feed_urls:
+        try:
+            feed = feedparser.parse(url)
+            if feed.bozo and feed.bozo_exception:
+                raise feed.bozo_exception
+            for entry in feed.entries[:max_per_feed]:
+                articles.append({
+                    'title': entry.get('title', 'No title'),
+                    'link':  entry.get('link', ''),
+                    'source': source_label
+                })
+        except Exception as e:
+            print(f"[WARN] Feed ignorado ({url}): {e}")
+    return articles
+
+
 def run():
     all_articles = []
-    
-    # Coletar de fontes oficiais
-    for url in OFFICIAL_FEEDS:
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:5]:
-            all_articles.append({'title': entry.title, 'link': entry.link, 'source': 'OFFICIAL'})
+    all_articles += collect_feeds(OFFICIAL_FEEDS, 'OFFICIAL')
+    all_articles += collect_feeds(NEWS_FEEDS, 'NEWS')
 
-    # Coletar de fontes de notícias
-    for url in NEWS_FEEDS:
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:5]:
-            all_articles.append({'title': entry.title, 'link': entry.link, 'source': 'NEWS'})
+    print(f"[INFO] Total de artigos coletados: {len(all_articles)}")
 
-    # Processamento Inteligente com Gemini
     result = filter_and_summarize(all_articles)
-    
-    if result:
-        # Formatação para o Discord
-        formatted_news = []
-        # Quebrar o resultado da IA em blocos
-        blocks = result.split("---")
-        for block in blocks:
-            if "TITLE:" in block:
-                # Extrair campos com cuidado
-                lines = block.strip().split("\n")
-                title = lines[0].replace("TITLE:", "").strip()
-                summary = lines[1].replace("SUMMARY:", "").strip()
-                link = lines[2].replace("LINK:", "").strip()
-                
-                # Desativa pre-visualização com < >
-                formatted_news.append(f"🚀 **{title}**\n{summary}\n🔗 <{link}>")
 
-        if formatted_news:
-            header = "🤖 **INTELLIGENCE REPORT: SELECTED AI NEWS**\n\n"
-            final_message = header + "\n\n".join(formatted_news)
-            
-            # Envia em partes se exceder 2000 caracteres
-            if len(final_message) > 2000:
-                final_message = final_message[:1990] + "..."
-                
-            requests.post(DISCORD_WEBHOOK, json={"content": final_message})
+    if not result:
+        print("[ERROR] Gemini nao retornou resultado.")
+        return
+
+    news_items = parse_blocks(result)
+    print(f"[INFO] Noticias parseadas: {len(news_items)}")
+
+    send_to_discord(DISCORD_WEBHOOK, news_items)
+
 
 if __name__ == "__main__":
     run()
