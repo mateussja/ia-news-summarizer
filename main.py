@@ -1,16 +1,16 @@
 import os
 import re
+import time
 import feedparser
 import requests
-import google.generativeai as genai
+from google import genai
 
 # Configurações
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
-genai.configure(api_key=GEMINI_KEY)
-# FIX #3: modelo atualizado (gemini-1.5-flash foi depreciado)
-model = genai.GenerativeModel('gemini-2.0-flash')
+client = genai.Client(api_key=GEMINI_KEY)
+MODEL = "gemini-2.0-flash"
 
 OFFICIAL_FEEDS = [
     'https://openai.com/news/rss.xml',
@@ -30,6 +30,7 @@ NEWS_FEEDS = [
     'https://www.wired.com/category/science/ai/feed/',
     'https://www.zdnet.com/topic/artificial-intelligence/rss.xml'
 ]
+
 
 def filter_and_summarize(all_articles):
     articles_text = "\n".join([
@@ -55,19 +56,28 @@ def filter_and_summarize(all_articles):
     {articles_text}
     """
 
-    try:
-        response = model.generate_content(prompt)
-        return response.text if response.text else None
-    except Exception as e:
-        print(f"Error in Gemini Processing: {e}")
-        return None
+    # Retry com backoff para lidar com rate limits transientes (429)
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=prompt
+            )
+            return response.text if response.text else None
+        except Exception as e:
+            err = str(e)
+            if "429" in err and attempt < 2:
+                wait = 60 * (attempt + 1)
+                print(f"[WARN] Rate limit hit, aguardando {wait}s (tentativa {attempt + 1}/3)...")
+                time.sleep(wait)
+            else:
+                print(f"[ERROR] Gemini falhou: {e}")
+                return None
+
+    return None
 
 
 def parse_blocks(result):
-    """
-    FIX #1: parser robusto usando regex, independente de linhas vazias
-    ou ordem dos campos no output do Gemini.
-    """
     news_items = []
     blocks = result.split("---")
 
@@ -81,10 +91,11 @@ def parse_blocks(result):
         link_match    = re.search(r'LINK:\s*(https?://\S+)', block, re.IGNORECASE)
 
         if title_match and summary_match and link_match:
-            title   = title_match.group(1).strip()
-            summary = summary_match.group(1).strip()
-            link    = link_match.group(1).strip()
-            news_items.append((title, summary, link))
+            news_items.append((
+                title_match.group(1).strip(),
+                summary_match.group(1).strip(),
+                link_match.group(1).strip()
+            ))
         else:
             print(f"[WARN] Bloco ignorado (campos faltando):\n{block[:200]}")
 
@@ -92,10 +103,6 @@ def parse_blocks(result):
 
 
 def send_to_discord(webhook_url, news_items):
-    """
-    FIX #2: envia em multiplas mensagens se necessario,
-    sem cortar conteudo no meio.
-    """
     if not news_items:
         print("[WARN] Nenhuma noticia para enviar.")
         return
@@ -128,15 +135,14 @@ def send_to_discord(webhook_url, news_items):
 
 
 def collect_feeds(feed_urls, source_label, max_per_feed=5):
-    """
-    FIX #4: coleta com tratamento de erro por feed individual.
-    """
     articles = []
     for url in feed_urls:
         try:
             feed = feedparser.parse(url)
-            if feed.bozo and feed.bozo_exception:
-                raise feed.bozo_exception
+            # bozo indica XML malformado, mas feedparser ainda parseia o que consegue
+            # só ignora se não trouxe nenhuma entry
+            if not feed.entries:
+                raise ValueError(f"Nenhuma entry retornada (bozo={feed.bozo})")
             for entry in feed.entries[:max_per_feed]:
                 articles.append({
                     'title': entry.get('title', 'No title'),
@@ -154,6 +160,10 @@ def run():
     all_articles += collect_feeds(NEWS_FEEDS, 'NEWS')
 
     print(f"[INFO] Total de artigos coletados: {len(all_articles)}")
+
+    if not all_articles:
+        print("[ERROR] Nenhum artigo coletado. Abortando.")
+        return
 
     result = filter_and_summarize(all_articles)
 
