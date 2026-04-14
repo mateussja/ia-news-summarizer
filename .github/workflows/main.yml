@@ -1,0 +1,27 @@
+name: Executar Resumo de IA
+
+on:
+  schedule:
+    - cron: '0 12 * * *' # 12:00 UTC = 09:00 Horário de Brasília
+  workflow_dispatch: # Permite rodar manualmente clicando em um botão
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v3
+      
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      
+      - name: Instalar bibliotecas
+        run: pip install -r requirements.txt
+      
+      - name: Rodar Script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python main.py
